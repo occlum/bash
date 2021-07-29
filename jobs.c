@@ -28,6 +28,10 @@
 #include <stdio.h>
 #include <signal.h>
 #include <errno.h>
+#include <spawn.h>
+#include <assert.h>
+#include <sys/syscall.h>
+#include <stdarg.h>
 
 #if defined (HAVE_UNISTD_H)
 #  include <unistd.h>
@@ -5134,3 +5138,611 @@ restore_pgrp_pipe (p)
 }
 
 #endif /* PGRP_PIPE */
+
+// For Occlum Specific:
+// To support environment without fork. Use posix_spawn instead
+#define ARG_MAX 131072 // based on limits.h
+
+extern char *find_path_file_safe PARAMS((const char *, char *));
+
+// For temporary script file:
+static const char tmp_file_template[] = ".script.lock.XXXXXX";
+static struct flock sub_script_lock = { F_WRLCK, SEEK_SET, 0, 0, 0 };
+
+static int set_child_process_file_actions(posix_spawn_file_actions_t *file_action,
+        REDIRECT *redirected, int pipe_in, int pipe_out) {
+    int ret = 0;
+    if (redirected) {
+        if (0 <= redirected->redirectee.dest && redirected->redirectee.dest < 4) {
+            // echo xxx 2>&1 (dup2(1, 2) redirects stderror to stdout)
+            ret = posix_spawn_file_actions_adddup2(file_action, redirected->redirectee.dest,
+                                                   redirected->redirector.dest);
+            if (ret != 0) {
+              sys_error("posix_spawn_file_actions_adddup2 failed: %d", errno);
+              return ret;
+            }
+            if (redirected->next != NULL) {
+                // echo xxx 2>&1 > a.log
+                ret = posix_spawn_file_actions_addopen(file_action,
+                                                       (size_t)redirected->redirectee.filename,
+                                                       redirected->next->redirectee.filename->word, redirected->next->flags, 0666);
+                if (ret != 0) {
+                  sys_error("posix_spawn_file_actions_addopen failed: %d", errno);
+                  return ret;
+                }
+            }
+        } else {
+            // echo xxx > a.log
+            ret = posix_spawn_file_actions_addopen(file_action, 1,
+                                                   redirected->redirectee.filename->word, redirected->flags, 0666);
+            if (ret != 0) {
+              sys_error("posix_spawn_file_actions_addopen failed: %d", errno);
+              return ret;
+            }
+            if (redirected->next != NULL) {
+                // echo xxx > a.log 2>&1
+                assert(redirected->next->redirectee.dest < 4);
+                ret = posix_spawn_file_actions_adddup2(file_action, redirected->next->redirectee.dest,
+                                                       redirected->next->redirector.dest);
+                if (ret != 0) {
+                  sys_error("posix_spawn_file_actions_adddup2 failed: %d", errno);
+                  return ret;
+                }
+            }
+        }
+    }
+    if (pipe_out != NO_PIPE) {
+        // only output
+        ret = posix_spawn_file_actions_adddup2(file_action, pipe_out, 1);
+        if (ret != 0) {
+            sys_error("posix_spawn_file_actions_adddup2 failed: %d", errno);
+            return ret;
+        }
+        ret = posix_spawn_file_actions_addclose(file_action, pipe_out);
+        if (ret != 0) {
+            sys_error("posix_spawn_file_actions_addclose failed: %d", errno);
+            return ret;
+        }
+    }
+    if (pipe_in != NO_PIPE) {
+        ret = posix_spawn_file_actions_adddup2(file_action, pipe_in, 0);
+        if (ret != 0) {
+            sys_error("posix_spawn_file_actions_adddup2 failed: %d", errno);
+            return ret;
+        }
+        ret = posix_spawn_file_actions_addclose(file_action, pipe_in);
+        if (ret != 0) {
+            sys_error("posix_spawn_file_actions_addclose failed: %d", errno);
+            return ret;
+        }
+    }
+    return ret;
+}
+
+// Create a locked temp script file for Bash to execute. In this way, Bash can spawn self and use this script
+// name as an argument.
+static int create_temp_script(char *subshell_script, char *command) {
+    strncpy(subshell_script, shell_script_dir_path, strlen(shell_script_dir_path));
+    strncat(subshell_script, "/", 1);
+    strncat(subshell_script, tmp_file_template, strlen(tmp_file_template));
+    // generate a tmp file name and open
+    #if defined (DEBUG)
+      itrace("create tmp file: %s\n", subshell_script);
+    #endif
+    int fd = mkstemp(subshell_script);
+    if (fd == 0) {
+      sys_error("create tmp file %s failed\n", subshell_script);
+      return -1;
+    }
+
+    // TODO: Replace with flock when enabled in Occlum
+    if (fcntl(fd, F_SETLK, &sub_script_lock) != 0) {
+      sys_error("exclusive lock file failed with errno = %d\n", errno);
+      // no need to return this error
+    }
+
+    SHELL_VAR **shell_functions = all_visible_functions();
+    if (shell_functions != NULL) {
+      print_func_list_to_file(shell_functions, fd);
+    }
+    size_t len = write(fd, command, strlen(command));
+    if (len <= 0) {
+      sys_error("write tmp file %s failed\n", subshell_script);
+      return -1;
+    }
+
+    return fd;
+}
+
+static int children_routine_simple_internal(struct nofork_child_args *recv_args, WORD_LIST *cmd_list) {
+  pid_t mypid;
+  int ret = 0;
+  posix_spawn_file_actions_t file_action;
+  ret = posix_spawn_file_actions_init(&file_action);
+  if (ret != 0) {
+      sys_error("posix_spawn_file_actions_init failed: %d\n", errno);
+      return -1;
+  }
+  posix_spawnattr_t attr;
+  ret = posix_spawnattr_init(&attr);
+  if (ret != 0) {
+      sys_error("posix_spawnattr_init failed: %d\n", errno);
+      posix_spawn_file_actions_destroy(&file_action);
+      return -1;
+  }
+  int async_p = recv_args->async;
+  SIMPLE_COM *simple_cmd = (SIMPLE_COM *)recv_args->cmd_list;
+  #if defined (DEBUG)
+      itrace("thread id = %ld, word list in %s:", syscall(SYS_gettid), __func__);
+      WORD_LIST *current = cmd_list;
+      while ( current != NULL) {
+          itrace(" %s ", current->word->word);
+          current = current->next;
+      }
+  #endif
+  REDIRECT *redirected = simple_cmd->redirects;
+  int pipe_in = recv_args->pipe_in;
+  int pipe_out = recv_args->pipe_out;
+  char **argvs = strvec_from_word_list (cmd_list, 0, 0, (int *)NULL);
+  char *cmd = strdup(cmd_list->word->word);
+  char *cmd_path = (char *)calloc(1, PATH_MAX);
+  if (cmd == NULL || cmd_path == NULL) {
+    sys_error("memory allocation failed: %d\n", errno);
+    goto error_out;
+  }
+  // FIXME: find_path_file fails for no reason. Might be memory problem.
+  if ( find_path_file_safe(cmd, cmd_path) == NULL ) {
+      #if defined (DEBUG)
+        itrace("file not found");
+      #endif
+      goto error_out;
+  };
+
+  #if defined (DEBUG)
+    itrace("command path at %p\n", cmd_path);
+    itrace("command path = %s\n", cmd_path);
+  #endif
+
+  // E.g. echo xxx 2>&1 > a.log needs:
+  // dup2(1,2), open(a.log) = 3, dup2(3,1)
+  ret = set_child_process_file_actions(&file_action, redirected, pipe_in, pipe_out);
+  if (ret != 0) {
+      sys_error ("set child process file actions error code = %d\n", errno);
+      goto error_out;
+  }
+
+  char **current_env = make_env_array_from_var_list(all_visible_variables());
+
+  // Restore sigmask for child
+  ret = posix_attribute_restore_sigmask(&attr);
+  if (ret != 0) {
+      sys_error("posix_attribute_restore_sigmask failed: %d\n", errno);
+      goto error_out;
+  }
+
+  ret = posix_spawn(&mypid, cmd_path, &file_action, &attr, argvs, current_env);
+  if (ret != 0) {
+      sys_error ("posix_spawn error code = %d\n", errno);
+      goto error_out;
+  }
+
+  // No need to wait here. After make_child there will be wait_for of bash for more functionalities.
+  // We rely on Bash to manage process for simple commands like here. For complicated commands like subshell
+  // or substitution, we manage the process on our own.
+
+  add_process(cmd, mypid);
+  free(cmd_path);
+  posix_spawn_file_actions_destroy(&file_action);
+  posix_spawnattr_destroy(&attr);
+  #if defined (DEBUG)
+    itrace("bash new process [%d] started %d\n", mypid, ret);
+  #endif
+  return mypid;
+
+error_out:
+  posix_spawn_file_actions_destroy(&file_action);
+  posix_spawnattr_destroy(&attr);
+  free(cmd_path);
+  free(cmd);
+  return -1;
+}
+
+static int children_routine_for_simple_cmd (struct nofork_child_args *recv_args) {
+  SIMPLE_COM *simple_cmd = (SIMPLE_COM *)recv_args->cmd_list;
+  WORD_LIST *cmd_list = simple_cmd->words;
+
+  return children_routine_simple_internal(recv_args, cmd_list);
+}
+
+int children_routine_for_pipe_cmd (struct nofork_child_args *recv_args) {
+  SIMPLE_COM *simple_cmd = (SIMPLE_COM *)recv_args->cmd_list;
+  WORD_LIST *cmd_list = expand_words(
+                              simple_cmd->words);
+  return children_routine_simple_internal(recv_args, cmd_list);
+}
+
+static int children_routine_for_subshell (struct nofork_child_args *recv_args) {
+    char *command = recv_args->command_str;
+    int pipe_in = recv_args->pipe_in;
+    int pipe_out = recv_args->pipe_out;
+
+    // Strip the subshell "()" symbol
+    int cmd_len = strlen(command) - 2;
+    command[cmd_len] = 0;
+    command = &command[2];
+    #if defined (DEBUG)
+      itrace("child_thread [%ld] for subshell will execute: %s",
+            syscall(SYS_gettid),
+            command);
+    #endif
+
+    int ret = 0;
+    pid_t mypid;
+
+    // Generate a tmp file name which must be under the same diretory with the actual script file
+    char subshell_script[PATH_MAX] = {0};
+    int tmp_script_fd = create_temp_script(subshell_script, command);
+    if (tmp_script_fd < 0) {
+      sys_error("create temp script file failed\n");
+      return -1;
+    }
+
+    char bash_bin[PATH_MAX] = {0};
+    size_t len = readlink("/proc/self/exe", bash_bin, PATH_MAX);
+    if (len <= 0) {
+      sys_error("readlink failed with errno %d\n", errno);
+      return -1;
+    }
+    #if defined (DEBUG)
+      itrace("subshell spawn new bash at %s", bash_bin);
+    #endif
+
+    // export all local variables to new spawned bash process
+    char **current_env = make_env_array_from_var_list(all_visible_variables());
+    char *argv[] = {"bash", subshell_script, NULL};
+    ret = posix_spawn(&mypid, bash_bin, NULL, NULL, argv,
+                      current_env);
+    if (ret != 0) {
+        sys_error("posix_spawn error code = %d\n", errno);
+        exit(errno);
+    }
+
+    waitpid(mypid, &ret, 0);
+    #if defined (DEBUG)
+      itrace("bash new process [%d] ends with %d\n", mypid, ret);
+    #endif
+
+    close(tmp_script_fd); // auto release flock
+    unlink(subshell_script);
+    return mypid;
+}
+
+static int children_routine_for_cmd_subst (struct nofork_child_args *recv_args) {
+    char *command = recv_args->command_str;
+    int pipe_in = recv_args->pipe_in;
+    int pipe_out = recv_args->pipe_out;
+    #if defined (DEBUG)
+      itrace("child_thread [%ld] for command substitution will execute: %s",
+            syscall(SYS_gettid),
+            command);
+    #endif
+
+    int ret = 0;
+    pid_t mypid;
+    posix_spawn_file_actions_t file_action;
+    ret = posix_spawn_file_actions_init(&file_action);
+    if (ret != 0) {
+        sys_error("posix_spawn_file_actions_init failed: %d\n", errno);
+        return -1;
+    }
+
+    // For commands in command substitution, we just need to close read end, and duplicate write end
+    ret = posix_spawn_file_actions_adddup2(&file_action, pipe_out, 1);
+    if (ret != 0) {
+        sys_error("posix_spawn_file_actions_adddup2 failed: %d\n", errno);
+        return -1;
+    }
+
+    // Derived from subst.c:6430
+    /* If standard output is closed in the parent shell
+     (such as after `exec >&-'), file descriptor 1 will be
+     the lowest available file descriptor, and end up in
+     fildes[0].  This can happen for stdin and stderr as well,
+     but stdout is more important -- it will cause no output
+     to be generated from this command. */
+    if ((pipe_out != fileno (stdin)) &&
+            (pipe_out != fileno (stdout)) &&
+            (pipe_out != fileno (stderr))) {
+        ret = posix_spawn_file_actions_addclose(&file_action, pipe_out);
+        if (ret != 0) {
+            sys_error("posix_spawn_file_actions_addclose failed: %d\n", errno);
+            return -1;
+        }
+    }
+
+    if ((pipe_in != fileno (stdin)) &&
+            (pipe_in != fileno (stdout)) &&
+            (pipe_in != fileno (stderr))) {
+        ret = posix_spawn_file_actions_addclose(&file_action, pipe_in);
+        if (ret != 0) {
+            sys_error("posix_spawn_file_actions_addclose failed: %d\n", errno);
+            return -1;
+        }
+    }
+
+    // Generate a tmp file name which must be under the same diretory with the actual script file
+    char subshell_script[PATH_MAX] = {0};
+    int tmp_script_fd = create_temp_script(subshell_script, command);
+    if (tmp_script_fd < 0) {
+      sys_error("create temp script file failed\n");
+      return -1;
+    }
+
+    char bash_bin[PATH_MAX] = {0};
+    size_t len = readlink("/proc/self/exe", bash_bin, PATH_MAX);
+    if (len <= 0) {
+      sys_error("readlink failed with errno %d\n", errno);
+      return -1;
+    }
+    #if defined (DEBUG)
+      itrace("command substitute spawn new bash at %s", bash_bin);
+    #endif
+
+    // As this is command substitution, we must export all local variables to new spawned bash process
+    char **current_env = make_env_array_from_var_list(all_visible_variables());
+    char *argv[] = {"bash", subshell_script, NULL};
+    ret = posix_spawn(&mypid, bash_bin, &file_action, NULL, argv,
+                      current_env);
+    if (ret != 0) {
+        sys_error("posix_spawn error code = %d\n", errno);
+        return -1;
+    }
+
+    waitpid(mypid, &ret, 0);
+    #if defined (DEBUG)
+      itrace("bash new process [%d] ends with %d\n", mypid, ret);
+    #endif
+
+    close(tmp_script_fd); // auto release flock
+    unlink(subshell_script);
+    posix_spawn_file_actions_destroy(&file_action);
+    return mypid;
+}
+
+static int children_routine_for_process_subst (struct nofork_child_args *recv_args) {
+    char *command = recv_args->command_str;
+    int parent_pipe_fd = recv_args->pipe_in;
+    int child_pipe_fd = recv_args->pipe_out;
+    int open_for_read_in_child = recv_args->open_for_read_in_child;
+    #if defined (DEBUG)
+      itrace("child_thread [%ld] for process substitution will execute: %s",
+            syscall(SYS_gettid),
+            command);
+    #endif
+
+    int ret = 0;
+    pid_t mypid;
+    posix_spawn_file_actions_t file_action;
+    ret = posix_spawn_file_actions_init(&file_action);
+    if (ret != 0) {
+        sys_error("posix_spawn_file_actions_init failed: %d\n", errno);
+        return -1;
+    }
+
+    // Derived from subst.c: 5975 to manipulate file actions of child pipe
+    // For commands in command substitution, we just need to close read end, and duplicate write end
+    ret = posix_spawn_file_actions_adddup2(&file_action, child_pipe_fd,
+                                           open_for_read_in_child ? 0 : 1);
+    if (ret != 0) {
+        sys_error("posix_spawn_file_actions_adddup2 failed: %d\n", errno);
+        return -1;
+    }
+
+    if (child_pipe_fd != (open_for_read_in_child ? 0 : 1)) {
+        ret = posix_spawn_file_actions_addclose(&file_action, child_pipe_fd);
+        if (ret != 0) {
+            sys_error("posix_spawn_file_actions_addclose failed: %d\n", errno);
+            return -1;
+        }
+    }
+
+    ret = posix_spawn_file_actions_addclose(&file_action, parent_pipe_fd);
+    if (ret != 0) {
+        sys_error("posix_spawn_file_actions_addclose failed: %d\n", errno);
+        return -1;
+    }
+
+    // Generate a tmp file name which must be under the same diretory with the actual script file
+    char subshell_script[PATH_MAX] = {0};
+    int tmp_script_fd = create_temp_script(subshell_script, command);
+    if (tmp_script_fd < 0) {
+      sys_error("create temp script file failed\n");
+      return -1;
+    }
+
+    // Construct bash arguments
+    char bash_bin[PATH_MAX] = {0};
+    if (readlink("/proc/self/exe", bash_bin, PATH_MAX) < 0) {
+      sys_error("readlink failed with errno %d\n", errno);
+      return -1;
+    };
+    #if defined (DEBUG)
+      itrace("command substitute spawn new bash at %s", bash_bin);
+    #endif
+    char *argv[ARG_MAX] = {"bash", subshell_script, NULL};
+    int shell_argv = 0;
+    char **shell_args = strvec_from_word_list(list_rest_of_args(), 0, 0, &shell_argv);
+    for (int i = 0; i < shell_argv; i++) {
+        argv[2 + i] = shell_args[i];
+    }
+    // As this is command substitution, we must export all local variables to new spawned bash process
+    char **current_env = make_env_array_from_var_list(all_visible_variables());
+    ret = posix_spawn(&mypid, bash_bin, &file_action, NULL, argv,
+                      current_env);
+    if (ret != 0) {
+        sys_error("posix_spawn error code = %d\n", errno);
+        return -1;
+    }
+    waitpid(mypid, &ret, 0);
+    #if defined (DEBUG)
+      itrace("bash new process [%d] ends with %d\n", mypid, ret);
+    #endif
+
+    close(tmp_script_fd); // auto release flock
+    unlink(subshell_script);
+    posix_spawn_file_actions_destroy(&file_action);
+    return mypid;
+}
+
+// Derived from make_child. This is the core function to make_child without fork.
+pid_t make_child_without_fork(operation, command, flags, pipe_in, pipe_out,
+        open_for_read_in_child, cmd_list_simple)
+char *operation;
+char *command;
+int flags;
+int pipe_in;
+int pipe_out;
+int open_for_read_in_child;
+SIMPLE_COM *cmd_list_simple;
+{
+    int async_p, forksleep;
+    sigset_t set, oset, termset, chldset, oset_copy;
+    pid_t pid;
+    SigHandler *oterm;
+    char stack[1024 + PATH_MAX];
+
+    sigemptyset (&oset_copy);
+    sigprocmask (SIG_BLOCK, (sigset_t *)NULL, &oset_copy);
+    sigaddset (&oset_copy, SIGTERM);
+
+    /* Block SIGTERM here and unblock in child after fork resets the
+       set of pending signals. */
+    sigemptyset (&set);
+    sigaddset (&set, SIGCHLD);
+    sigaddset (&set, SIGINT);
+    sigaddset (&set, SIGTERM);
+
+    sigemptyset (&oset);
+    sigprocmask (SIG_BLOCK, &set, &oset);
+
+    making_children ();
+
+    async_p = (flags & FORK_ASYNC);
+    forksleep = 1;
+
+#if defined (BUFFERED_INPUT)
+    /* If default_buffered_input is active, we are reading a script.  If
+       the command is asynchronous, we have already duplicated /dev/null
+       as fd 0, but have not changed the buffered stream corresponding to
+       the old fd 0.  We don't want to sync the stream in this case. */
+    if (default_buffered_input != -1 &&
+            (!async_p || default_buffered_input > 0)) {
+        sync_buffered_stream (default_buffered_input);
+    }
+#endif /* BUFFERED_INPUT */
+
+    int child_pid = 0;
+    struct nofork_child_args *arg = (struct nofork_child_args *)calloc(1,
+                                    sizeof(struct nofork_child_args));
+    if (arg == NULL) {
+      sys_error("memory allocation failed: %d\n", errno);
+      return -1;
+    }
+    arg->async = async_p;
+    arg->command_str = command;
+    arg->pipe_in = pipe_in;
+    arg->pipe_out = pipe_out;
+
+    // Handle different operations
+    if (strcmp(operation, "simple_cmd") == 0) {
+      arg->cmd_list = (void *)cmd_list_simple;
+      child_pid = children_routine_for_simple_cmd(arg);
+    } else if (strcmp(operation, "pipe_cmd") == 0) {
+      arg->cmd_list = (void *)cmd_list_simple;
+      child_pid = children_routine_for_pipe_cmd(arg);
+    } else if (strcmp(operation, "subshell") == 0) {
+      child_pid = children_routine_for_subshell(arg);
+    } else if (strcmp(operation, "process_subst") == 0) {
+      arg->open_for_read_in_child = open_for_read_in_child;
+      child_pid = children_routine_for_process_subst(arg);
+    } else if (strcmp(operation, "cmd_subst") == 0) {
+      child_pid = children_routine_for_cmd_subst(arg);
+    } else {
+      sys_error("unhandled operation type: %s\n", operation);
+      free(arg);
+      return -1;
+    }
+    #if defined (DEBUG)
+      itrace("%s - %s - spawn new process [%d] executing: %s", __func__, operation, child_pid,
+            arg->command_str);
+    #endif
+    pid = child_pid;
+    free(arg);
+
+    if (pid < 0 ) {
+        sys_error ("posix_spawn");
+
+        /* Kill all of the processes in the current pipeline. */
+        terminate_current_pipeline ();
+
+        /* Discard the current pipeline, if any. */
+        if (the_pipeline) {
+            kill_current_pipeline ();
+        }
+
+        set_exit_status (EX_NOEXEC);
+
+        // Comment below line to handle script like: fake_cmd || true
+        // throw_to_top_level ();	/* Reset signals, etc. */
+    }
+
+    /* In the parent.  Remember the pid of the child just created
+    as the proper pgrp if this is the first child. */
+
+    if (job_control) {
+        if (pipeline_pgrp == 0) {
+            pipeline_pgrp = pid;
+            /* Don't twiddle terminal pgrps in the parent!  This is the bug,
+            not the good thing of twiddling them in the child! */
+            /* give_terminal_to (pipeline_pgrp, 0); */
+        }
+        /* This is done on the recommendation of the Rationale section of
+           the POSIX 1003.1 standard, where it discusses job control and
+           shells.  It is done to avoid possible race conditions. (Ref.
+           1003.1 Rationale, section B.4.3.3, page 236). */
+        setpgid (pid, pipeline_pgrp);
+    } else {
+        if (pipeline_pgrp == 0) {
+            pipeline_pgrp = shell_pgrp;
+        }
+    }
+
+    if (async_p) {
+        last_asynchronous_pid = pid;
+    }
+
+  // For simple command, we let Bash to do the process management for us.
+  // For other usecases, don't do this.
+  if (strcmp(operation, "simple_cmd") == 0 || strcmp(operation, "pipe_cmd") == 0) {
+    /* Delete the saved status for any job containing this PID in case it's
+    been reused. */
+    delete_old_job (pid); // skip this and bgp delete
+
+    /* Perform the check for pid reuse unconditionally.  Some systems reuse
+    PIDs before giving a process CHILD_MAX/_SC_CHILD_MAX unique ones. */
+    bgp_delete (pid);		/* new process, discard any saved status */
+  }
+
+    last_made_pid = child_pid;
+
+    /* keep stats */
+    js.c_totforked++;
+    js.c_living++;
+
+    /* Unblock SIGTERM, SIGINT, and SIGCHLD unless creating a pipeline, in
+    which case SIGCHLD remains blocked until all commands in the pipeline
+     have been created (execute_cmd.c:execute_pipeline()). */
+    sigprocmask (SIG_SETMASK, &oset, (sigset_t *)NULL);
+
+    return (child_pid);
+}

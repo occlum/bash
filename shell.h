@@ -111,6 +111,8 @@ extern int no_line_editing;
 
 extern char *shell_name;
 extern char *current_host_name;
+// To know the shell script location
+extern char shell_script_dir_path[];
 
 extern int subshell_argc;
 extern char **subshell_argv;

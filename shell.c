@@ -37,6 +37,8 @@
 #include <stdio.h>
 #include <signal.h>
 #include <errno.h>
+#include <string.h>
+#include <libgen.h>
 #include "filecntl.h"
 #if defined (HAVE_PWD_H)
 #  include <pwd.h>
@@ -121,6 +123,9 @@ struct user_info current_user =
 
 /* The current host's name. */
 char *current_host_name = (char *)NULL;
+
+// TODO?: This may not be sufficient if there are nested script files?
+char shell_script_dir_path[PATH_MAX] = {0};
 
 /* Non-zero means that this shell is a login shell.
    Specifically:
@@ -1696,6 +1701,10 @@ open_shell_script (script_name)
        before. */
     init_interactive_script ();
 
+  // Occlum notes: get shell_script_dir_path here
+  filename = full_pathname(filename);
+  char *dir = dirname(filename);
+  strncpy(shell_script_dir_path, dir, strlen(dir));
   free (filename);
 
   reading_shell_script = 1;

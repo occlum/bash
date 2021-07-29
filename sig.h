@@ -26,6 +26,7 @@
 #include "stdc.h"
 
 #include <signal.h>		/* for sig_atomic_t */
+#include <spawn.h>
 
 #if !defined (SIGABRT) && defined (SIGIOT)
 #  define SIGABRT SIGIOT
@@ -123,6 +124,7 @@ extern void top_level_cleanup PARAMS((void));
 extern void throw_to_top_level PARAMS((void));
 extern void jump_to_top_level PARAMS((int)) __attribute__((__noreturn__));
 extern void restore_sigmask PARAMS((void));
+extern int posix_attribute_restore_sigmask PARAMS((posix_spawnattr_t *));
 
 extern sighandler sigwinch_sighandler PARAMS((int));
 extern void set_sigwinch_handler PARAMS((void));

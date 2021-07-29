@@ -310,6 +310,7 @@ extern SHELL_VAR **all_array_variables PARAMS((void));
 #endif
 extern char **all_variables_matching_prefix PARAMS((const char *));
 
+extern char **make_env_array_from_var_list PARAMS((SHELL_VAR **));
 extern char **make_var_array PARAMS((HASH_TABLE *));
 extern char **add_or_supercede_exported_var PARAMS((char *, int));
 
@@ -382,6 +383,7 @@ extern void put_gnu_argv_flags_into_env PARAMS((intmax_t, char *));
 
 extern void print_var_list PARAMS((SHELL_VAR **));
 extern void print_func_list PARAMS((SHELL_VAR **));
+extern void print_func_list_to_file PARAMS((SHELL_VAR **, int));
 extern void print_assignment PARAMS((SHELL_VAR *));
 extern void print_var_value PARAMS((SHELL_VAR *, int));
 extern void print_var_function PARAMS((SHELL_VAR *));
