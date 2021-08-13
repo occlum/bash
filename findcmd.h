@@ -35,6 +35,7 @@ extern int executable_or_directory PARAMS((const char *));
 extern char *find_user_command PARAMS((const char *));
 extern char *find_in_path PARAMS((const char *, char *, int));
 extern char *find_path_file PARAMS((const char *));
+extern char *find_path_file_safe PARAMS((const char *, char *));
 extern char *search_for_command PARAMS((const char *, int));
 extern char *user_command_matches PARAMS((const char *, int, int));
 extern void setup_exec_ignore PARAMS((char *));

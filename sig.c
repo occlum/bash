@@ -478,6 +478,14 @@ restore_sigmask ()
 #endif
 }
 
+int
+posix_attribute_restore_sigmask (posix_spawnattr_t *attr) {
+    int ret = 0;
+    ret = posix_spawnattr_setflags(attr, POSIX_SPAWN_SETSIGMASK);
+    ret += posix_spawnattr_setsigmask(attr, &top_level_mask);
+    return ret;
+}
+
 sighandler
 termsig_sighandler (sig)
      int sig;

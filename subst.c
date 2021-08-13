@@ -5936,7 +5936,9 @@ process_substitute (string, open_for_read_in_child)
   save_pipeline (1);
 #endif /* JOB_CONTROL */
 
-  pid = make_child ((char *)NULL, FORK_ASYNC);
+  // return child's pid
+  pid = make_child_without_fork("process_subst",string, FORK_ASYNC,
+                    parent_pipe_fd, child_pipe_fd, open_for_read_in_child, NULL);
   if (pid == 0)
     {
 #if 0
@@ -5996,7 +5998,9 @@ process_substitute (string, open_for_read_in_child)
 
   if (pid > 0)
     {
-#if defined (JOB_CONTROL)
+// Occlum notes: We don't have plan for interactive shell. And We don't rely on Bash's job control.
+// Thus job control is not supported.
+#if 0
       last_procsub_child = restore_pipeline (0);
       /* We assume that last_procsub_child->next == last_procsub_child because
 	 of how jobs.c:add_process() works. */
@@ -6366,8 +6370,10 @@ command_substitute (string, quoted, flags)
 
   old_async_pid = last_asynchronous_pid;
   fork_flags = (subshell_environment&SUBSHELL_ASYNC) ? FORK_ASYNC : 0;
-  pid = make_child ((char *)NULL, fork_flags|FORK_NOTERM);
-  last_asynchronous_pid = old_async_pid;
+
+  // return child's pid
+  pid = make_child_without_fork("cmd_subst", string, fork_flags | FORK_NOTERM,
+                      fildes[0], fildes[1], 0, NULL);
 
   if (pid == 0)
     {
@@ -6548,7 +6554,12 @@ command_substitute (string, quoted, flags)
       UNBLOCK_SIGNAL (oset);
 
       current_command_subst_pid = pid;
-      last_command_exit_value = wait_for (pid, JWAIT_NOTERM);
+
+      // last_command_exit_value = wait_for (pid, JWAIT_NOTERM);
+      // Occlum notes: We manage the child process life cycle on our own instead of
+      // adding children to Bash's watch list. So Bash won't find this child.
+      last_command_exit_value = 0;
+
       last_command_subst_pid = pid;
       last_made_pid = old_pid;
 
