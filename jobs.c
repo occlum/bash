@@ -86,6 +86,8 @@
 # include <readline/readline.h>
 #endif
 
+#include "redir.h"
+
 #if !defined (errno)
 extern int errno;
 #endif /* !errno */
@@ -5153,6 +5155,11 @@ static int set_child_process_file_actions(posix_spawn_file_actions_t *file_actio
         REDIRECT *redirected, int pipe_in, int pipe_out) {
     int ret = 0;
     if (redirected) {
+        /* Expand the redirect filename first. Otherwise the commands
+        'cat /etc/hosts >> $TMP/alltests' may not correctly parse the $TMP.*/
+        char *expand_fn = redirection_expand(redirected->redirectee.filename);
+        redirected->redirectee.filename = make_bare_word(expand_fn);
+
         if (0 <= redirected->redirectee.dest && redirected->redirectee.dest < 4) {
             // echo xxx 2>&1 (dup2(1, 2) redirects stderror to stdout)
             ret = posix_spawn_file_actions_adddup2(file_action, redirected->redirectee.dest,
